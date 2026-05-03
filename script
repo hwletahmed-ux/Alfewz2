@@ -1,0 +1,134 @@
+Alfewz Center — Cloud Code
+   Zoom OAuth token exchange + basic bootstrap
+*/
+
+function requireUser(req){ if(!req.user) throw new Parse.Error(209,'Login required'); return req.user; }
+function requireRole(u, roles){ const r=u.get('role')||'student'; if(!roles.includes(r)) throw new Parse.Error(119,'Forbidden'); }
+
+Parse.Cloud.beforeSave(Parse.User, async (req)=>{
+  if(!req.object.existed()){
+    const count=await new Parse.Query(Parse.User).count({useMasterKey:true});
+    if(count===0) req.object.set('role','admin');
+    else if(!req.object.get('role')) req.object.set('role','student');
+  }
+});
+
+Parse.Cloud.define('integrationsStatus', async (req)=>{
+  const u=requireUser(req); requireRole(u,['admin']);
+  return {
+    twilio: !!(process.env.TWILIO_SID && process.env.TWILIO_TOKEN && process.env.TWILIO_FROM),
+    telegram: !!process.env.TELEGRAM_BOT_TOKEN,
+    zoom: !!(process.env.ZOOM_CLIENT_ID && process.env.ZOOM_CLIENT_SECRET)
+  };
+});
+
+async function doFetch(url, options){
+  const f=global.fetch;
+  if(!f) throw new Error('fetch not available');
+  const res=await f(url, options);
+  const text=await res.text();
+  let body; try{ body=JSON.parse(text);}catch(e){ body=text; }
+  return { ok: res.ok, status: res.status, body };
+}
+
+// Exchanges Zoom authorization code for access token (server-side)
+const ZOOM_REDIRECT_URI = 'https://supporte--agente--analaystics-agent-app.back4app.io/zoom/callback.html';
+
+function zoomBasicAuth(){
+  const clientId = process.env.ZOOM_CLIENT_ID;
+  const clientSecret = process.env.ZOOM_CLIENT_SECRET;
+  if(!clientId || !clientSecret) throw new Parse.Error(141,'Missing ZOOM_CLIENT_ID/ZOOM_CLIENT_SECRET env vars');
+  return Buffer.from(clientId + ':' + clientSecret).toString('base64');
+}
+
+async function zoomTokenRequest(params){
+  const basic = zoomBasicAuth();
+  const body = new URLSearchParams(params).toString();
+  const res = await doFetch('https://zoom.us/oauth/token', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Basic ' + basic,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body
+  });
+  if(!res.ok){
+    throw new Parse.Error(141, 'Zoom token request failed: ' + JSON.stringify(res.body));
+  }
+  return res.body;
+}
+
+// Exchanges Zoom authorization code for access token (server-side)
+Parse.Cloud.define('zoomExchangeCode', async (req)=>{
+  const user=requireUser(req);
+  requireRole(user, ['teacher','admin']);
+  const { code } = req.params;
+  if(!code) throw new Parse.Error(141,'Missing code');
+
+  // Force .io redirect URL to avoid mismatch
+  const token = await zoomTokenRequest({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: ZOOM_REDIRECT_URI
+  });
+
+  user.set('zoomAccessToken', token.access_token);
+  user.set('zoomRefreshToken', token.refresh_token);
+  user.set('zoomTokenType', token.token_type);
+  user.set('zoomTokenExpiresIn', token.expires_in);
+  user.set('zoomTokenCreatedAt', new Date());
+  await user.save(null, { useMasterKey: true });
+
+  return { ok:true, expiresIn: token.expires_in };
+});
+
+// Refresh access token using stored refresh token
+Parse.Cloud.define('zoomRefreshToken', async (req)=>{
+  const user=requireUser(req);
+  requireRole(user, ['teacher','admin']);
+  const refreshToken = req.params.refreshToken || user.get('zoomRefreshToken');
+  if(!refreshToken) throw new Parse.Error(141,'Missing refresh token');
+
+  const token = await zoomTokenRequest({
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken
+  });
+
+  user.set('zoomAccessToken', token.access_token)
+  // Zoom may rotate refresh token
+  if(token.refresh_token) user.set('zoomRefreshToken', token.refresh_token);
+  user.set('zoomTokenType', token.token_type);
+  user.set('zoomTokenExpiresIn', token.expires_in);
+  user.set('zoomTokenCreatedAt', new Date());
+  await user.save(null, { useMasterKey: true });
+
+  return { ok:true, expiresIn: token.expires_in };
+});
+
+// Returns a valid access token; auto-refreshes if expired
+Parse.Cloud.define('zoomGetValidAccessToken', async (req)=>{
+  const user=requireUser(req);
+  requireRole(user, ['teacher','admin']);
+  const access = user.get('zoomAccessToken');
+  const createdAt = user.get('zoomTokenCreatedAt');
+  const expiresIn = user.get('zoomTokenExpiresIn') || 0;
+  const refresh = user.get('zoomRefreshToken');
+
+  const isExpired = !access || !createdAt || !expiresIn || (Date.now() > (new Date(createdAt).getTime() + (expiresIn-60)*1000));
+  if(!isExpired) return { ok:true, accessToken: access };
+
+  // try refresh
+  if(!refresh) throw new Parse.Error(141,'No refresh token stored. Reconnect Zoom.');
+  const token = await zoomTokenRequest({ grant_type:'refresh_token', refresh_token: refresh });
+
+  user.set('zoomAccessToken', token.access_token);
+  if(token.refresh_token) user.set('zoomRefreshToken', token.refresh_token);
+  user.set('zoomTokenType', token.token_type);
+  user.set('zoomTokenExpiresIn', token.expires_in);
+  user.set('zoomTokenCreatedAt', new Date());
+  await user.save(null, { useMasterKey: true });
+
+  return { ok:true, accessToken: token.access_token, refreshed:true };
+});
+
+Parse.Cloud.define('health', async ()=>({ok:true,time:new Date().toISOString()}));
